@@ -117,15 +117,16 @@ class Sensors():
                     Sensor("6100_40464100", "power_l2", "W"),
                     Sensor("6100_40464200", "power_l3", "W"),
                     # DC side - PV Generation
+                    # or 6380_40251E00 ???
                     Sensor("6100_0046C200", "pv_power", "W"),
-                    Sensor("6380_40251E00_0", "pv_power_a", "W"),
-                    Sensor("6380_40251E00_1", "pv_power_b", "W"),
+                    # Sensor("6380_40251E00_0", "pv_power_a", "W"),
+                    # Sensor("6380_40251E00_1", "pv_power_b", "W"),
                     Sensor("6380_40451F00", "pv_voltage", "V", 100),
-                    Sensor("6380_40451F00_0", "pv_voltage_a", "V", 100),
-                    Sensor("6380_40451F00_1", "pv_voltage_b", "V", 100),
+                    # Sensor("6380_40451F00_0", "pv_voltage_a", "V", 100),
+                    # Sensor("6380_40451F00_1", "pv_voltage_b", "V", 100),
                     Sensor("6380_40452100", "pv_current", "A", 1000),
-                    Sensor("6380_40452100_0", "pv_current_a", "A", 1000),
-                    Sensor("6380_40452100_1", "pv_current_b", "A", 1000),
+                    # Sensor("6380_40452100_0", "pv_current_a", "A", 1000),
+                    # Sensor("6380_40452100_1", "pv_current_b", "A", 1000),
                     Sensor("6400_0046C300", "pv_gen_meter", "kWh", 1000),
                     Sensor("6400_00260100", "total_yield", "kWh", 1000),
                     Sensor("6400_00262200", "daily_yield", "Wh"),
@@ -135,8 +136,9 @@ class Sensors():
                     Sensor("6400_00462400", "grid_total_yield", "kWh", 1000),
                     Sensor("6400_00462500", "grid_total_absorbed", "kWh", 1000),
                     # Consumption = Energy from the PV system and grid
-                    Sensor("6100_00543100", "current_consumption", "W"),
-                    Sensor("6400_00543A00", "total_consumption", "kWh", 1000),
+                    # Sensor("6100_00543100", "current_consumption", "W"),
+                    # Sensor("6400_00543A00", "total_consumption", "kWh", 1000),
+
                     # General
                     Sensor(
                         "6180_08214800",
@@ -145,6 +147,16 @@ class Sensors():
                         None,
                         ('"1"[0].val[0].tag', "val[0].tag"),
                     ),
+
+                    # SBS 3.7
+                    Sensor("6100_00295A00", "sbs_battery_charge", "%",
+                           None, ('"7"[0].val')),
+                    Sensor("6400_00262200", "sbs_battery_discharge", "Wh",
+                           None, ('"7"[0].val')),
+                    Sensor("6400_00462500", "sbs_battery_charge_total", "Wh",
+                           None, ('"7"[0].val')),
+
+
                 )
             )
 
@@ -324,7 +336,8 @@ class SMA:
 
     async def read_logger(self, sensors, start, end):
         """Read a logging key and return the results."""
-        payload = {"destDev": [], "key": int(sensors[0].key), "tStart": start, "tEnd": end}
+        payload = {"destDev": [], "key": int(
+            sensors[0].key), "tStart": start, "tEnd": end}
         result_body = await self._read_body(URL_LOGGER, payload)
         if not result_body:
             return False
