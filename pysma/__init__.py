@@ -4,257 +4,192 @@ See: http://www.sma.de/en/products/monitoring-control/webconnect.html
 
 Source: http://www.github.com/kellerza/pysma
 """
-import asyncio
+import copy
 import json
 import logging
+from typing import Any, Dict, Optional
 
-import async_timeout
-import attr
-import jmespath
-from aiohttp import client_exceptions
+import jmespath  # type: ignore
+from aiohttp import ClientSession, ClientTimeout, client_exceptions, hdrs
+
+from . import definitions
+from .const import (
+    DEFAULT_TIMEOUT,
+    DEVCLASS_INVERTER,
+    DEVICE_INFO,
+    ENERGY_METER_VIA_INVERTER,
+    FALLBACK_DEVICE_INFO,
+    OPTIMIZERS_VIA_INVERTER,
+    URL_DASH_LOGGER,
+    URL_DASH_VALUES,
+    URL_LOGGER,
+    URL_LOGIN,
+    URL_LOGOUT,
+    URL_VALUES,
+    USERS,
+)
+from .exceptions import (
+    SmaAuthenticationException,
+    SmaConnectionException,
+    SmaReadException,
+)
+from .helpers import version_int_to_string
+from .sensor import Sensors
 
 _LOGGER = logging.getLogger(__name__)
-
-USERS = {"user": "usr", "installer": "istl"}
-
-JMESPATH_BASE = "result.*"
-JMESPATH_VAL_IDX = '"1"[{}].val'
-JMESPATH_VAL = "val"
-
-
-@attr.s(slots=True)
-class Sensor():
-    """pysma sensor definition."""
-
-    key = attr.ib()
-    name = attr.ib()
-    unit = attr.ib()
-    factor = attr.ib(default=None)
-    path = attr.ib(default=None)
-    value = attr.ib(default=None, init=False)
-    key_idx = attr.ib(default=0, repr=False, init=False)
-
-    def __attrs_post_init__(self):
-        """Init path."""
-        idx = 0
-        key = str(self.key)
-        if key[-2] == "_" and key[-1].isdigit():
-            idx = key[-1]
-            key = key[:-2]
-        self.key = key
-        self.key_idx = idx
-
-    def extract_logger(self, result_body):
-        """Extract logs from json body."""
-        self.value = result_body
-
-    def extract_value(self, result_body):
-        """Extract value from json body."""
-        try:
-            res = result_body[self.key]
-        except (KeyError, TypeError):
-            _LOGGER.warning("Sensor %s: Not found in %s", self.key, result_body)
-            res = self.value
-            self.value = None
-            return self.value != res
-
-        if not isinstance(self.path, str):
-            # Try different methods until we can decode...
-            _paths = (
-                list(self.path)
-                if isinstance(self.path, (list, tuple))
-                else [JMESPATH_VAL, JMESPATH_VAL_IDX.format(self.key_idx)]
-            )
-
-            while _paths:
-                _path = _paths.pop()
-                _val = jmespath.search(_path, res)
-                if _val is not None:
-                    _LOGGER.debug(
-                        "Sensor %s: Will be decoded with %s from %s",
-                        self.name,
-                        _path,
-                        res,
-                    )
-                    self.path = _path
-                    break
-
-        # Extract new value
-        if isinstance(self.path, str):
-            res = jmespath.search(self.path, res)
-        else:
-            _LOGGER.debug(
-                "Sensor %s: No successful value decoded yet: %s", self.name, res
-            )
-            res = None
-
-        if isinstance(res, (int, float)) and self.factor:
-            res /= self.factor
-        try:
-            return res != self.value
-        finally:
-            self.value = res
-
-
-class Sensors():
-    """SMA Sensors."""
-
-    def __init__(self, add_default_sensors=True):
-        self.__s = []
-        if add_default_sensors:
-            self.add(
-                (
-                    # AC side - Grid measurements
-                    Sensor("6100_40263F00", "grid_power", "W"),
-                    Sensor("6100_00465700", "frequency", "Hz", 100),
-                    Sensor("6100_00464800", "voltage_l1", "V", 100),
-                    Sensor("6100_00464900", "voltage_l2", "V", 100),
-                    Sensor("6100_00464A00", "voltage_l3", "V", 100),
-                    Sensor("6100_40465300", "current_l1", "A", 1000),
-                    Sensor("6100_40465400", "current_l2", "A", 1000),
-                    Sensor("6100_40465500", "current_l3", "A", 1000),
-                    Sensor("6100_40464000", "power_l1", "W"),
-                    Sensor("6100_40464100", "power_l2", "W"),
-                    Sensor("6100_40464200", "power_l3", "W"),
-                    # DC side - PV Generation
-                    # or 6380_40251E00 ???
-                    Sensor("6100_0046C200", "pv_power", "W"),
-                    # Sensor("6380_40251E00_0", "pv_power_a", "W"),
-                    # Sensor("6380_40251E00_1", "pv_power_b", "W"),
-                    Sensor("6380_40451F00", "pv_voltage", "V", 100),
-                    # Sensor("6380_40451F00_0", "pv_voltage_a", "V", 100),
-                    # Sensor("6380_40451F00_1", "pv_voltage_b", "V", 100),
-                    Sensor("6380_40452100", "pv_current", "A", 1000),
-                    # Sensor("6380_40452100_0", "pv_current_a", "A", 1000),
-                    # Sensor("6380_40452100_1", "pv_current_b", "A", 1000),
-                    Sensor("6400_0046C300", "pv_gen_meter", "kWh", 1000),
-                    Sensor("6400_00260100", "total_yield", "kWh", 1000),
-                    Sensor("6400_00262200", "daily_yield", "Wh"),
-                    # AC side - Measured values - Grid measurements
-                    Sensor("6100_40463600", "grid_power_supplied", "W"),
-                    Sensor("6100_40463700", "grid_power_absorbed", "W"),
-                    Sensor("6400_00462400", "grid_total_yield", "kWh", 1000),
-                    Sensor("6400_00462500", "grid_total_absorbed", "kWh", 1000),
-                    # Consumption = Energy from the PV system and grid
-                    # Sensor("6100_00543100", "current_consumption", "W"),
-                    # Sensor("6400_00543A00", "total_consumption", "kWh", 1000),
-
-                    # General
-                    Sensor(
-                        "6180_08214800",
-                        "status",
-                        "",
-                        None,
-                        ('"1"[0].val[0].tag', "val[0].tag"),
-                    ),
-
-                    # SBS 3.7
-                    Sensor("6100_00295A00", "sbs_battery_charge", "%",
-                           None, ('"7"[0].val')),
-                    Sensor("6400_00262200", "sbs_battery_discharge", "Wh",
-                           None, ('"7"[0].val')),
-                    Sensor("6400_00462500", "sbs_battery_charge_total", "Wh",
-                           None, ('"7"[0].val')),
-
-
-                )
-            )
-
-    def __len__(self):
-        """Length."""
-        return len(self.__s)
-
-    def __contains__(self, key):
-        """Get a sensor using either the name or key."""
-        try:
-            if self[key]:
-                return True
-        except KeyError:
-            return False
-
-    def __getitem__(self, key):
-        """Get a sensor using either the name or key."""
-        for sen in self.__s:
-            if sen.name == key or sen.key == key:
-                return sen
-        raise KeyError(key)
-
-    def __iter__(self):
-        """Iterator."""
-        return self.__s.__iter__()
-
-    def add(self, sensor):
-        """Add a sensor, warning if it exists."""
-        if isinstance(sensor, (list, tuple)):
-            for sss in sensor:
-                self.add(sss)
-            return
-
-        if not isinstance(sensor, Sensor):
-            raise TypeError("pysma.Sensor expected")
-
-        if sensor.name in self:
-            old = self[sensor.name]
-            self.__s.remove(old)
-            _LOGGER.warning("Replacing sensor %s with %s", old, sensor)
-
-        if sensor.key in self and self[sensor.key].key_idx is sensor.key_idx:
-            _LOGGER.warning(
-                "Duplicate SMA sensor key %s (idx: %s)", sensor.key, sensor.key_idx
-            )
-
-        self.__s.append(sensor)
-
-
-URL_LOGIN = "/dyn/login.json"
-URL_LOGOUT = "/dyn/logout.json"
-URL_VALUES = "/dyn/getValues.json"
-URL_LOGGER = "/dyn/getLogger.json"
 
 
 class SMA:
     """Class to connect to the SMA webconnect module and read parameters."""
 
-    def __init__(self, session, url, password, group="user", uid=None):
-        """Init SMA connection."""
+    # pylint: disable=too-many-instance-attributes
+    _aio_session: ClientSession
+    _new_session_data: Optional[dict]
+    _url: str
+    sma_sid: Optional[str]
+    sma_uid: Optional[str]
+    l10n: dict
+    devclass: Optional[str]
+    device_info_sensors: Sensors
+
+    def __init__(
+        self,
+        session: ClientSession,
+        url: str,
+        password: Optional[str] = None,
+        group: str = "user",
+        uid: Optional[str] = None,
+    ):
+        """Init SMA connection.
+
+        Args:
+            session (ClientSession): aiohttp client session
+            url (str): Url or IP address of device
+            password (str, optional): Password to use during login. Defaults to None.
+            group (str, optional): Username to use during login. Defaults to "user".
+            uid (str, optional): uid used for data extraction. Defaults to None.
+
+        Raises:
+            KeyError: User was not in USERS
+        """
         # pylint: disable=too-many-arguments
         if group not in USERS:
             raise KeyError("Invalid user type: {}".format(group))
-        if len(password) > 12:
+        if password is not None and len(password) > 12:
             _LOGGER.warning("Password should not exceed 12 characters")
-        self._new_session_data = {"right": USERS[group], "pass": password}
+        if password is None:
+            self._new_session_data = None
+        else:
+            self._new_session_data = {"right": USERS[group], "pass": password}
         self._url = url.rstrip("/")
         if not url.startswith("http"):
             self._url = "http://" + self._url
         self._aio_session = session
         self.sma_sid = None
         self.sma_uid = uid
+        self.l10n = {}
+        self.devclass = None
+        self.device_info_sensors = Sensors(definitions.sensor_map[DEVICE_INFO])
 
-    async def _fetch_json(self, url, payload):
-        """Fetch json data for requests."""
-        params = {
-            "data": json.dumps(payload),
-            "headers": {"content-type": "application/json"},
-            "params": {"sid": self.sma_sid} if self.sma_sid else None,
-        }
-        for _ in range(3):
-            try:
-                with async_timeout.timeout(10):
-                    res = await self._aio_session.post(self._url + url, **params)
-                    return (await res.json()) or {}
-            except (asyncio.TimeoutError, client_exceptions.ClientError):
-                continue
-        return {"err": "Could not connect to SMA at {} (timeout)".format(self._url)}
+    async def _request_json(
+        self, method: str, url: str, **kwargs: Dict[str, Any]
+    ) -> dict:
+        """Request json data for requests.
 
-    async def _read_body(self, url, payload):
-        if self.sma_sid is None:
+        Args:
+            method (str): HTTP method to use
+            url (str): URL to do request to
+
+        Raises:
+            SmaConnectionException: Connection to device failed
+
+        Returns:
+            dict: json returned by device
+        """
+        if self.sma_sid:
+            kwargs.setdefault("params", {})
+            kwargs["params"]["sid"] = self.sma_sid
+
+        _LOGGER.debug("Sending %s request to %s: %s", method, url, kwargs)
+
+        try:
+            res = await self._aio_session.request(
+                method,
+                self._url + url,
+                timeout=ClientTimeout(total=DEFAULT_TIMEOUT),
+                **kwargs,
+            )
+        except client_exceptions.ClientError as exc:
+            raise SmaConnectionException(
+                f"Could not connect to SMA at {self._url}"
+            ) from exc
+
+        try:
+            res_json = await res.json()
+        except (client_exceptions.ContentTypeError, json.decoder.JSONDecodeError):
+            _LOGGER.warning("Request to %s did not return a valid json.", url)
+            return {}
+
+        return res_json or {}
+
+    async def _get_json(self, url: str) -> dict:
+        """Get json data for requests.
+
+        Args:
+            url (str): URL to do GET request to
+
+        Returns:
+            dict: json returned by device
+        """
+        return await self._request_json(hdrs.METH_GET, url)
+
+    async def _post_json(self, url: str, payload: Optional[dict] = None) -> dict:
+        """Post json data for requests.
+
+        Args:
+            url (str): URL to do POST request to
+            payload (dict, optional): payload to send to device. Defaults to None.
+
+        Returns:
+            dict: json returned by device
+        """
+        params: Dict[str, Any] = {}
+        if payload is not None:
+            params["data"] = json.dumps(payload)
+            params["headers"] = {"content-type": "application/json"}
+
+        return await self._request_json(hdrs.METH_POST, url, **params)
+
+    async def _read_l10n(self, lang: str = "en-US") -> dict:
+        """Read device language file.
+
+        Args:
+            lang (str, optional): Language code of file to retrieve. Defaults to "en-US".
+
+        Returns:
+            dict: json returned by device
+        """
+        return await self._get_json(f"/data/l10n/{lang}.json")
+
+    async def _read_body(self, url: str, payload: dict) -> dict:
+        """Parse the json returned by the device and extract result.
+
+        Args:
+            url (str): URL to reqquest data from
+            payload (dict): payload to send to device
+        Raises:
+            SmaReadException: The json returned by the device was in an unexpected format
+
+        Returns:
+            dict: json result
+        """
+        if self.sma_sid is None and self._new_session_data is not None:
             await self.new_session()
-            if self.sma_sid is None:
-                return None
-        body = await self._fetch_json(url, payload=payload)
+        body = await self._post_json(url, payload)
 
         # On the first error we close the session which will re-login
         err = body.get("err")
+
         if err is not None:
             _LOGGER.warning(
                 "%s: error detected, closing session to force another login attempt, got: %s",
@@ -262,11 +197,11 @@ class SMA:
                 body,
             )
             await self.close_session()
-            return None
+            raise SmaReadException("Error detected while reading")
 
-        if not isinstance(body, dict) or "result" not in body:
+        if "result" not in body:
             _LOGGER.warning("No 'result' in reply from SMA, got: %s", body)
-            return None
+            raise SmaReadException("No 'result' in reply from SMA")
 
         if self.sma_uid is None:
             # Get the unique ID
@@ -282,9 +217,17 @@ class SMA:
 
         return result_body
 
-    async def new_session(self):
-        """Establish a new session."""
-        body = await self._fetch_json(URL_LOGIN, self._new_session_data)
+    async def new_session(self) -> bool:
+        """Establish a new session.
+
+        Raises:
+            SmaAuthenticationException: Authentication failed
+
+        Returns:
+            bool: authentication successful
+        """
+        self.l10n = await self._read_l10n()
+        body = await self._post_json(URL_LOGIN, self._new_session_data)
         self.sma_sid = jmespath.search("result.sid", body)
         if self.sma_sid:
             return True
@@ -299,34 +242,51 @@ class SMA:
                 _LOGGER.error(msg, err)
         else:
             _LOGGER.error(msg, "Session ID expected [result.sid]")
-        return False
 
-    async def close_session(self):
+        raise SmaAuthenticationException()
+
+    async def close_session(self) -> None:
         """Close the session login."""
         if self.sma_sid is None:
             return
         try:
-            await self._fetch_json(URL_LOGOUT, {})
+            await self._post_json(URL_LOGOUT)
         finally:
             self.sma_sid = None
 
-    async def read(self, sensors):
-        """Read a set of keys."""
-        payload = {"destDev": [], "keys": list({s.key for s in sensors})}
-        result_body = await self._read_body(URL_VALUES, payload)
+    async def read(self, sensors: Sensors) -> bool:
+        """Read a set of keys.
+
+        Args:
+            sensors (Sensors): Sensors object containing Sensor objects to read
+
+        Returns:
+            bool: reading was successful
+        """
+        if self._new_session_data is None:
+            payload: Dict[str, Any] = {"destDev": [], "keys": []}
+            result_body = await self._read_body(URL_DASH_VALUES, payload)
+        else:
+            payload = {
+                "destDev": [],
+                "keys": list({s.key for s in sensors if s.enabled}),
+            }
+            result_body = await self._read_body(URL_VALUES, payload)
         if not result_body:
             return False
 
         notfound = []
+        devclass = await self.get_devclass(result_body)
         for sen in sensors:
-            if sen.key in result_body:
-                sen.extract_value(result_body)
-                continue
+            if sen.enabled:
+                if sen.key in result_body:
+                    sen.extract_value(result_body, self.l10n, str(devclass))
+                    continue
 
-            notfound.append(f"{sen.name} [{sen.key}]")
+                notfound.append(f"{sen.name} [{sen.key}]")
 
         if notfound:
-            _LOGGER.warning(
+            _LOGGER.info(
                 "No values for sensors: %s. Response from inverter: %s",
                 ",".join(notfound),
                 result_body,
@@ -334,15 +294,165 @@ class SMA:
 
         return True
 
-    async def read_logger(self, sensors, start, end):
-        """Read a logging key and return the results."""
-        payload = {"destDev": [], "key": int(
-            sensors[0].key), "tStart": start, "tEnd": end}
+    async def read_dash_logger(self) -> dict:
+        """Read the dash loggers.
+
+        Returns:
+            dict: Dictionary containing loggers returned by device.
+        """
+        return await self._read_body(URL_DASH_LOGGER, {"destDev": [], "key": []})
+
+    async def read_logger(self, log_id: int, start: int, end: int) -> list:
+        """Read a logging key and return the results.
+
+        Args:
+            log_id (int): The ID of the log to read.
+                totWhOut5min: 28672
+                totWhOutDaily: 28704
+                GridMsTotWhOutDaily: 28752
+                GridMsTotWhInDaily: 28768
+                ObjLogBatCha: 28816
+                totWhIn5min: 28736
+                totWhInDaily: 28768
+                ObjLogBatChrg: 29344
+                ObjLogBatDsch: 29360
+            start (int): Start timestamp in seconds.
+            end (int): End timestamp in seconds.
+
+        Returns:
+            list: The log entries returned by the device
+        """
+        payload = {
+            "destDev": [],
+            "key": log_id,
+            "tStart": start,
+            "tEnd": end,
+        }
         result_body = await self._read_body(URL_LOGGER, payload)
-        if not result_body:
-            return False
+        if not isinstance(result_body, list):
+            raise SmaReadException("List of log entries expected.")
 
-        for sen in sensors:
-            sen.extract_logger(result_body)
+        return result_body
 
-        return True
+    async def device_info(self) -> dict:
+        """Read device info and return the results.
+
+        Returns:
+            dict: dict containing serial, name, type, manufacturer and sw_version
+        """
+        await self.read(self.device_info_sensors)
+
+        device_info = {
+            "serial": self.device_info_sensors["serial_number"].value
+            or FALLBACK_DEVICE_INFO["serial"],
+            "name": self.device_info_sensors["device_name"].value
+            or FALLBACK_DEVICE_INFO["name"],
+            "type": self.device_info_sensors["device_type"].value
+            or FALLBACK_DEVICE_INFO["type"],
+            "manufacturer": self.device_info_sensors["device_manufacturer"].value
+            or FALLBACK_DEVICE_INFO["manufacturer"],
+            "sw_version": version_int_to_string(
+                self.device_info_sensors["device_sw_version"].value
+            ),
+        }
+
+        return device_info
+
+    async def get_devclass(self, result_body: Optional[dict] = None) -> Optional[str]:
+        """Get the device class.
+
+        Args:
+            result_body (dict, optional): result body to extract device class from.
+                Defaults to None.
+
+        Raises:
+            KeyError: More than 1 device class key is not supported
+
+        Returns:
+            str: The device class identifier, or None if no identifier was found
+        """
+        if self.devclass:
+            return self.devclass
+
+        if not result_body or not isinstance(result_body, dict):
+            # Read the STATUS_SENSOR.
+            # self.read will call get_devclass and update self.devclass
+            await self.read(Sensors(definitions.status))
+        else:
+            sensor_values = list(result_body.values())
+            devclass_keys = list(sensor_values[0].keys())
+            if len(devclass_keys) == 0:
+                return None
+            if len(devclass_keys) > 1:
+                raise KeyError("More than 1 device class key is not supported")
+            if devclass_keys[0] == "val":
+                return None
+
+            self.devclass = devclass_keys[0]
+            _LOGGER.debug("Found device class %s", self.devclass)
+
+        return self.devclass
+
+    async def get_sensors(self) -> Sensors:
+        """Get the sensors based on the device class.
+
+        Returns:
+            Sensors: Sensors object containing Sensor objects
+        """
+        # Fallback to DEVCLASS_INVERTER if devclass returns None
+        devclass = await self.get_devclass() or DEVCLASS_INVERTER
+
+        _LOGGER.debug("Loading sensors for device class %s", devclass)
+        device_sensors = Sensors(definitions.sensor_map.get(devclass))
+
+        if devclass == DEVCLASS_INVERTER:
+            em_sensor = copy.copy(definitions.energy_meter)
+            payload = {
+                "destDev": [],
+                "keys": [
+                    em_sensor.key,
+                    definitions.optimizer_serial.key,
+                ],
+            }
+            result_body = await self._read_body(URL_VALUES, payload)
+
+            if not result_body:
+                return device_sensors
+
+            # Detect and add Energy Meter sensors
+            em_sensor.extract_value(result_body)
+
+            if em_sensor.value:
+                _LOGGER.debug(
+                    "Energy Meter with serial %s detected. Adding extra sensors.",
+                    em_sensor.value,
+                )
+                device_sensors.add(
+                    [
+                        sensor
+                        for sensor in definitions.sensor_map[ENERGY_METER_VIA_INVERTER]
+                        if sensor not in device_sensors
+                    ]
+                )
+
+            # Detect and add Optimizer Sensors
+            optimizers = result_body.get(definitions.optimizer_serial.key)
+            if optimizers:
+                serials = optimizers.get(DEVCLASS_INVERTER)
+
+                for idx, serial in enumerate(serials or []):
+                    if serial["val"]:
+                        _LOGGER.debug(
+                            "Optimizer %s with serial %s detected. Adding extra sensors.",
+                            idx,
+                            serial,
+                        )
+                        for sensor_definition in definitions.sensor_map[
+                            OPTIMIZERS_VIA_INVERTER
+                        ]:
+                            new_sensor = copy.copy(sensor_definition)
+                            new_sensor.key_idx = idx
+                            new_sensor.name = f"{sensor_definition.name}_{idx}"
+                            device_sensors.add(new_sensor)
+
+        return device_sensors

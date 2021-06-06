@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 """pysma library setup."""
 from pathlib import Path
+
 from setuptools import setup
 
-VERSION = "0.3.5"
+VERSION = "0.5.0"
 URL = "https://github.com/kellerza/pysma"
 
 setup(
@@ -18,6 +19,6 @@ setup(
     author_email="kellerza@gmail.com",
     license="MIT",
     packages=["pysma"],
-    install_requires=["aiohttp>3,<4", "async_timeout>3,<4", "attrs>18", "jmespath<2"],
+    install_requires=["aiohttp>3.3,<4", "attrs>18", "jmespath<2"],
     zip_safe=True,
 )
